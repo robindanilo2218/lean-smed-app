@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import io
 
 # --- 1. CONFIGURACIÓN ---
 st.set_page_config(page_title="SMED Pro - Análisis", layout="wide")
@@ -11,20 +12,27 @@ with st.sidebar:
     st.title("⚙️ Configuración")
     st.markdown("### Opciones de Carga")
     
-    # Selector manual de separador
     sep_opt = st.selectbox(
         "Separador de CSV",
         ["Auto-Detectar", "Coma (,)", "Punto y Coma (;)", "Tabulación"],
-        help="Cambia esto si te sale error de lectura."
+        help="Si falla, prueba cambiar esto."
+    )
+    
+    encoding_opt = st.selectbox(
+        "Codificación", 
+        ["utf-8", "latin-1", "cp1252"], 
+        index=0,
+        help="Cambia a 'latin-1' si ves símbolos raros en el texto."
     )
     
     st.divider()
-    st.info("SMED Analytics v4.1 (Python Engine)")
+    st.info("SMED Analytics v4.2 (Text Scanner)")
 
-# --- 3. FUNCIÓN DE CARGA A PRUEBA DE ERRORES ---
-def load_data_v4_1(file, separator_mode):
+# --- 3. FUNCIÓN DE CARGA AVANZADA (TEXT SCANNER) ---
+def load_data_v4_2(file, separator_mode, encoding):
     """
-    Usa engine='python' para evitar errores de tokenización C.
+    Escanea el archivo como texto plano primero para encontrar el encabezado,
+    saltando metadatos superiores (Fecha, Turno, etc.) que rompen el CSV.
     """
     try:
         filename = file.name.lower()
@@ -32,48 +40,64 @@ def load_data_v4_1(file, separator_mode):
         
         # Determinar separador
         sep = None
+        if separator_mode == "Coma (,)": sep = ","
+        elif separator_mode == "Punto y Coma (;)": sep = ";"
+        elif separator_mode == "Tabulación": sep = "\t"
+        
+        header_row_idx = 0
+        
         if is_csv:
-            if separator_mode == "Coma (,)": sep = ","
-            elif separator_mode == "Punto y Coma (;)": sep = ";"
-            elif separator_mode == "Tabulación": sep = "\t"
-            # Si es Auto, sep=None permite al motor Python "olfatear" el separador
+            # --- ESTRATEGIA TEXTO PLANO (LA SOLUCIÓN) ---
+            # Leemos el archivo como strings para no depender de la estructura de columnas
+            content = file.getvalue().decode(encoding)
+            lines = content.splitlines()
             
-        # --- ESTRATEGIA DE LECTURA ---
-        # 1. Detectar encabezados
-        if is_csv:
-            # USAMOS SIEMPRE ENGINE='PYTHON' PARA EVITAR EL 'C ERROR'
-            try:
-                preview = pd.read_csv(file, nrows=20, header=None, sep=sep, engine='python')
-            except pd.errors.ParserError:
-                # Si falla, intentamos leer como texto plano para no crashear
-                return None, "Error de formato grave. Verifica que el CSV no tenga comillas rotas."
-            except Exception as e:
-                return None, f"Error leyendo previsualización: {e}"
-            file.seek(0)
+            keywords = ["actividad", "duracion", "tiempo", "tipo", "categoria", "grupo", "inicio"]
+            found = False
+            
+            # Buscamos en las primeras 50 líneas dónde empieza la tabla
+            for i, line in enumerate(lines[:50]):
+                line_lower = line.lower()
+                # Si la línea tiene al menos 2 palabras clave y separadores
+                matches = sum(1 for w in keywords if w in line_lower)
+                if matches >= 2:
+                    header_row_idx = i
+                    found = True
+                    break
+            
+            if not found:
+                return None, "No se encontró la fila de encabezados (Grupo, Actividad...) en las primeras 50 líneas."
+
+            # Ahora cargamos con Pandas saltando las líneas de "basura"
+            # Usamos io.StringIO para convertir el string en un "archivo virtual"
+            file.seek(0) # Reset no necesario porque usamos 'lines', pero por seguridad
+            df = pd.read_csv(
+                io.StringIO(content), 
+                header=header_row_idx, 
+                sep=sep, 
+                engine='python',
+                on_bad_lines='skip' # Si hay una línea rota más abajo, la salta
+            )
+
         else:
+            # Excel (xls/xlsx)
+            # Primero leemos sin header para buscar
             preview = pd.read_excel(file, nrows=20, header=None)
-
-        # Buscador de encabezados
-        header_idx = 0
-        keywords = ["actividad", "duración", "tiempo", "tipo", "categoría", "inicio", "grupo"]
-        max_matches = 0
-        
-        for i, row in preview.iterrows():
-            row_txt = row.astype(str).str.lower().tolist()
-            matches = sum(1 for w in keywords if any(w in str(x) for x in row_txt))
-            if matches > max_matches and matches >= 2:
-                max_matches = matches
-                header_idx = i
-        
-        # 2. Carga Final
-        if is_csv:
-            # on_bad_lines='skip' salta líneas corruptas en vez de detenerse
-            df = pd.read_csv(file, header=header_idx, sep=sep, engine='python', on_bad_lines='skip')
-        else:
-            df = pd.read_excel(file, header=header_idx)
+            keywords = ["actividad", "duracion", "tiempo", "tipo", "categoria", "grupo"]
             
-        return df, f"Carga OK (Encabezados en fila {header_idx + 1})"
+            for i, row in preview.iterrows():
+                row_txt = row.astype(str).str.lower().tolist()
+                matches = sum(1 for w in keywords if any(w in str(x) for x in row_txt))
+                if matches >= 2:
+                    header_row_idx = i
+                    break
+                    
+            df = pd.read_excel(file, header=header_row_idx)
+            
+        return df, f"Carga OK (Tabla detectada en línea {header_row_idx + 1})"
 
+    except UnicodeDecodeError:
+        return None, "Error de codificación. Prueba cambiar 'utf-8' a 'latin-1' en la barra lateral."
     except Exception as e:
         return None, f"Error General: {str(e)}"
 
@@ -85,18 +109,18 @@ st.subheader("1. Cargar Datos")
 uploaded_file = st.file_uploader("Sube tu Excel o CSV", type=["xlsx", "xls", "csv"])
 
 if uploaded_file is not None:
-    # Cargar usando la nueva función v4.1
-    df_original, status = load_data_v4_1(uploaded_file, sep_opt)
+    # Cargar usando la nueva función v4.2
+    df_original, status = load_data_v4_2(uploaded_file, sep_opt, encoding_opt)
     
     if df_original is None:
         st.error(status)
         st.stop()
     
-    # Validación de columnas pegadas
+    # Validación básica
     if len(df_original.columns) < 2:
         st.error("⚠️ El archivo se leyó como una sola columna.")
         st.warning(f"Columnas detectadas: '{df_original.columns[0]}'")
-        st.markdown("👉 **SOLUCIÓN:** Cambia el 'Separador de CSV' en la izquierda a **Punto y Coma (;)** o **Coma (,)**.")
+        st.markdown("👉 **SOLUCIÓN:** Cambia el 'Separador de CSV' en la izquierda.")
         st.stop()
         
     else:
@@ -131,17 +155,14 @@ if uploaded_file is not None:
             col_dur: "Duración Raw"
         }
         
-        # Validación de selección única
-        if len(set(rename_map.values())) != len(set(rename_map.keys())): 
-             # No bloqueamos, pero avisamos si el usuario mapea mal
-             pass
-
         df_work = df_work.rename(columns=rename_map)
 
         # --- LIMPIEZA ---
+        # Convertir duración (12,5 -> 12.5) y asegurar numérico
         df_work["Duración Actual (s)"] = df_work["Duración Raw"].astype(str).str.replace(',', '.', regex=False)
         df_work["Duración Actual (s)"] = pd.to_numeric(df_work["Duración Actual (s)"], errors='coerce').fillna(0)
 
+        # Inicializar futuros
         if "Tipo Futuro" not in df_work.columns: df_work["Tipo Futuro"] = df_work["Tipo Actual"]
         if "Duración Futura (s)" not in df_work.columns: df_work["Duración Futura (s)"] = df_work["Duración Actual (s)"]
 
@@ -184,11 +205,9 @@ if uploaded_file is not None:
 
         with tab1:
             fig = go.Figure()
-            # Actual
             for t in ["Interna", "Externa", "Muda"]:
                 val = sum_t(df_edited, "Tipo Actual", "Duración Actual (s)", t.lower())
                 fig.add_trace(go.Bar(name=t, x=['Actual'], y=[val], marker_color=colors[t]))
-            # Futuro
             for t in ["Interna", "Externa", "Muda"]:
                 val = sum_t(df_edited, "Tipo Futuro", "Duración Futura (s)", t.lower())
                 fig.add_trace(go.Bar(name=t, x=['Futuro'], y=[val], marker_color=colors[t], showlegend=False))
@@ -200,7 +219,7 @@ if uploaded_file is not None:
             st.markdown("##### Dispersión de Tiempos")
             eje_x = st.radio("Agrupar por:", ["Tipo Actual", "Categoría", "Actividad"], horizontal=True)
             if eje_x in df_edited.columns and not df_edited.empty:
-                if eje_x == "Actividad" and len(df_edited) > 30: st.warning("Muchas actividades detectadas. Usa zoom.")
+                if eje_x == "Actividad" and len(df_edited) > 30: st.warning("Muchas actividades. Usa zoom.")
                 fig_box = px.box(df_edited, x=eje_x, y="Duración Actual (s)", color="Tipo Actual", color_discrete_map=colors, points="all")
                 st.plotly_chart(fig_box, use_container_width=True)
 

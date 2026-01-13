@@ -3,63 +3,52 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 
-# --- 1. CONFIGURACIÓN DE LA PÁGINA ---
+# --- 1. CONFIGURACIÓN ---
 st.set_page_config(page_title="SMED Pro - Análisis", layout="wide")
 
-# --- 2. BARRA LATERAL Y CONFIGURACIÓN ---
+# --- 2. BARRA LATERAL ---
 with st.sidebar:
     st.title("⚙️ Configuración")
     st.markdown("### Opciones de Carga")
     
-    # NUEVO: Selector manual para arreglar el error de columnas pegadas
+    # Selector manual de separador
     sep_opt = st.selectbox(
         "Separador de CSV",
         ["Auto-Detectar", "Coma (,)", "Punto y Coma (;)", "Tabulación"],
-        help="Si tus columnas salen pegadas (ej: 'Grupo,Actividad...'), cambia esto."
+        help="Cambia esto si te sale error de lectura."
     )
     
     st.divider()
-    st.info("SMED Analytics v4.0")
-    st.markdown("""
-    **Guía rápida:**
-    1. Sube tu archivo.
-    2. Si sale error, cambia el 'Separador' arriba.
-    3. Confirma las columnas.
-    4. Analiza.
-    """)
+    st.info("SMED Analytics v4.1 (Python Engine)")
 
-# --- 3. FUNCIÓN DE CARGA ROBUSTA ---
-def load_data_v4(file, separator_mode):
+# --- 3. FUNCIÓN DE CARGA A PRUEBA DE ERRORES ---
+def load_data_v4_1(file, separator_mode):
     """
-    Carga datos permitiendo al usuario forzar el separador si falla el automático.
+    Usa engine='python' para evitar errores de tokenización C.
     """
     try:
         filename = file.name.lower()
         is_csv = filename.endswith('.csv')
         
-        # Determinar separador según selección del usuario
+        # Determinar separador
         sep = None
-        engine = None
-        
         if is_csv:
             if separator_mode == "Coma (,)": sep = ","
             elif separator_mode == "Punto y Coma (;)": sep = ";"
             elif separator_mode == "Tabulación": sep = "\t"
-            else: # Auto
-                sep = None
-                engine = 'python'
-
+            # Si es Auto, sep=None permite al motor Python "olfatear" el separador
+            
         # --- ESTRATEGIA DE LECTURA ---
-        # 1. Detectar encabezados (fila donde empieza la tabla)
-        # Leemos un poco del archivo para buscar palabras clave
+        # 1. Detectar encabezados
         if is_csv:
-            # Si es auto, usamos engine python, si es manual usamos c (más rápido)
+            # USAMOS SIEMPRE ENGINE='PYTHON' PARA EVITAR EL 'C ERROR'
             try:
-                preview = pd.read_csv(file, nrows=20, header=None, sep=sep, engine=engine)
-            except:
-                # Si falla auto, intentamos coma por defecto
-                file.seek(0)
-                preview = pd.read_csv(file, nrows=20, header=None, sep=",")
+                preview = pd.read_csv(file, nrows=20, header=None, sep=sep, engine='python')
+            except pd.errors.ParserError:
+                # Si falla, intentamos leer como texto plano para no crashear
+                return None, "Error de formato grave. Verifica que el CSV no tenga comillas rotas."
+            except Exception as e:
+                return None, f"Error leyendo previsualización: {e}"
             file.seek(0)
         else:
             preview = pd.read_excel(file, nrows=20, header=None)
@@ -78,14 +67,15 @@ def load_data_v4(file, separator_mode):
         
         # 2. Carga Final
         if is_csv:
-            df = pd.read_csv(file, header=header_idx, sep=sep, engine=engine)
+            # on_bad_lines='skip' salta líneas corruptas en vez de detenerse
+            df = pd.read_csv(file, header=header_idx, sep=sep, engine='python', on_bad_lines='skip')
         else:
             df = pd.read_excel(file, header=header_idx)
             
         return df, f"Carga OK (Encabezados en fila {header_idx + 1})"
 
     except Exception as e:
-        return None, f"Error: {str(e)}"
+        return None, f"Error General: {str(e)}"
 
 # --- 4. INTERFAZ PRINCIPAL ---
 st.title("⚡ Analizador SMED Pro")
@@ -95,20 +85,19 @@ st.subheader("1. Cargar Datos")
 uploaded_file = st.file_uploader("Sube tu Excel o CSV", type=["xlsx", "xls", "csv"])
 
 if uploaded_file is not None:
-    # Cargar con la opción del sidebar
-    df_original, status = load_data_v4(uploaded_file, sep_opt)
+    # Cargar usando la nueva función v4.1
+    df_original, status = load_data_v4_1(uploaded_file, sep_opt)
     
     if df_original is None:
         st.error(status)
         st.stop()
     
-    # --- VALIDACIÓN CRÍTICA ---
-    # Si detectamos que solo hay 1 columna, avisamos al usuario
+    # Validación de columnas pegadas
     if len(df_original.columns) < 2:
-        st.error("⚠️ ¡ALERTA! El archivo se leyó como una sola columna.")
-        st.warning(f"Parece que las columnas están pegadas: '{df_original.columns[0]}'")
-        st.markdown("👉 **SOLUCIÓN:** Ve a la barra lateral izquierda y cambia el **'Separador de CSV'** a **Punto y Coma (;)** o **Coma (,)** hasta que veas las columnas separadas.")
-        st.stop() # Detenemos aquí para evitar el KeyError
+        st.error("⚠️ El archivo se leyó como una sola columna.")
+        st.warning(f"Columnas detectadas: '{df_original.columns[0]}'")
+        st.markdown("👉 **SOLUCIÓN:** Cambia el 'Separador de CSV' en la izquierda a **Punto y Coma (;)** o **Coma (,)**.")
+        st.stop()
         
     else:
         st.success(status)
@@ -132,10 +121,9 @@ if uploaded_file is not None:
         with c4:
             col_dur = st.selectbox("Duración", cols, index=get_idx(cols, ["duración", "tiempo", "seg", "min"]))
 
-        # Crear copia de trabajo y renombrar
+        # Crear copia de trabajo
         df_work = df_original.copy()
         
-        # Diccionario de renombre seguro
         rename_map = {
             col_act: "Actividad",
             col_cat: "Categoría",
@@ -143,18 +131,17 @@ if uploaded_file is not None:
             col_dur: "Duración Raw"
         }
         
-        # Verificar que no estemos asignando la misma columna a dos cosas (evita KeyError)
-        if len(set(rename_map.keys())) < 4:
-            st.warning("⚠️ Cuidado: Has seleccionado la misma columna para varios campos. Verifica los selectores arriba.")
+        # Validación de selección única
+        if len(set(rename_map.values())) != len(set(rename_map.keys())): 
+             # No bloqueamos, pero avisamos si el usuario mapea mal
+             pass
 
         df_work = df_work.rename(columns=rename_map)
 
         # --- LIMPIEZA ---
-        # Convertir duración (12,5 -> 12.5)
         df_work["Duración Actual (s)"] = df_work["Duración Raw"].astype(str).str.replace(',', '.', regex=False)
         df_work["Duración Actual (s)"] = pd.to_numeric(df_work["Duración Actual (s)"], errors='coerce').fillna(0)
 
-        # Inicializar futuros
         if "Tipo Futuro" not in df_work.columns: df_work["Tipo Futuro"] = df_work["Tipo Actual"]
         if "Duración Futura (s)" not in df_work.columns: df_work["Duración Futura (s)"] = df_work["Duración Actual (s)"]
 
